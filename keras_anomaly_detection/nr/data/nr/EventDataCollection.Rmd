@@ -1,0 +1,126 @@
+---
+title: "Collecting Events"
+output:
+  html_notebook: default
+  pdf_document: default
+---
+
+We use a special New Relic R library available on github in the repo `bkayser/NewRelicR'.  
+However there's an internal fork I created that is more efficient to use when you don't 
+want to authenticate for each account accessed.  This fork is only available internally.
+
+```{r, results='hide'}
+#devtools::install('/Users/bill/workspace/NewRelicR', force=T)
+library(newrelic)
+```
+
+Other libraries used:
+
+```{r, results='hide'}
+library(dplyr)
+library(tibble)
+library(knitr)
+library(ggplot2)
+library(reshape2)
+library(rprojroot)
+library(lubridate)
+library(stringi)
+library(purrr)
+source('../../lib/nrdb-utils.R')
+```
+
+Other initialization:
+
+```{r, results='hide'}
+theme_set(theme_light())
+knitr::opts_chunk$set(echo = T, messages=F, warning=F, error = F, cache=T)
+```
+
+
+<style type="text/css">
+.table {
+    width: inherit;
+    max-width: 100%;
+    margin-bottom: 20px;
+}
+.math.display {
+  font-size: 28px;
+}
+</style>
+
+## Data Collection Utility Functions
+
+Some of the lower level utility functions are already defined in `cds-utils.R` and `nrdb-utils.R`.
+
+Here is where we define the actual tables we're looking at and the columns we're extracting.
+
+We use different servers for staging vs. production accounts.
+
+```{r}
+lookup_dirac_host <- function(account_id) {
+#    if (account_id == 1 || account_id == 550352) # Staging accounts
+#        Sys.getenv('DIRAC_STAGING_HOST')
+#    else
+        Sys.getenv('DIRAC_PROD_HOST')
+}
+```
+
+-------------
+
+```{r}
+account_id <- 1
+app_id <- 127809  # Alerts Production UI
+end_time <- floor_date(Sys.time(), 'days')
+begin_time <- end_time - ddays(28)
+sampling_rate <- 0.05
+```
+
+Load the data:
+
+```{r, echo=T}
+
+transactions.raw <- nrdb_events(account_id = account_id,
+                            app_id = app_id,
+                            start_time = begin_time,
+                            end_time = end_time,
+                            limit = 5000000,
+                            timeout = 40000,
+                            sampling_rate=sampling_rate,
+                            host = lookup_dirac_host(1)) 
+
+transactions <- transactions.raw %>%
+    mutate(timestamp = as.POSIXct(timestamp/1000, origin='1970-01-01'),
+           method = as.factor(request.method),
+           userAgent = as.factor(request.headers.userAgent),
+           transactionType = as.factor(transactionType),
+           apdexPerfZone = as.factor(nr.apdexPerfZone),
+           host = as.factor(host),
+           name = as.factor(name),
+           responseCode = as.factor(httpResponseCode),
+           transactionSubType = as.factor(transactionSubType)) %>%
+    select(-starts_with('response.headers'),
+           -tripId, 
+           -nr.tripId,
+           -request.method,
+           -customer_account_id,
+           -nr.referringPathHash,
+           -starts_with('request.headers.'),
+           -host.displayName,
+           -remote_address,
+           -httpResponseCode,
+           -nr.pathHash,
+           -nr.apdexPerfZone,
+           -nr.guid,
+           -appName,
+           -nr.referringTransactionGuid) 
+
+```
+
+Save the snapshot.
+
+```{r}
+basename <- paste0('eventdata/events-alerts-ui-',strftime(end_time, format = '%F'))
+saveRDS(transactions, paste0(basename, '.RDS'))
+gzcsv <- gzfile(paste0(basename, '.csv.gz'), 'w')
+write.csv(transactions, gzcsv, row.names = F)
+```

@@ -1,0 +1,322 @@
+---
+title: "Collecting Training Data"
+output:
+  html_notebook: default
+  pdf_document: default
+---
+
+We use a special New Relic R library available on github in the repo `bkayser/NewRelicR'.  
+However there's an internal fork I created that is more efficient to use when you don't 
+want to authenticate for each account accessed.  This fork is only available internally.
+
+```{r, message=F, error=F, warning=F}
+# devtools::install('/Users/bill/workspace/NewRelicR', force=T)
+library(newrelic)
+```
+
+Other libraries used:
+
+```{r, results='hide'}
+library(dplyr)
+library(tibble)
+library(knitr)
+library(ggplot2)
+library(reshape2)
+library(rprojroot)
+library(lubridate)
+library(stringi)
+library(purrr)
+library(caret)
+source('lib/nrdb-utils.R')
+source('lib/cds-utils.R')
+```
+
+Other initialization:
+
+```{r, results='hide'}
+theme_set(theme_light())
+knitr::opts_chunk$set(echo = T, messages=F, warning=F, error = F, cache=T)
+```
+
+
+<style type="text/css">
+.table {
+    width: inherit;
+    max-width: 100%;
+    margin-bottom: 20px;
+}
+.math.display {
+  font-size: 28px;
+}
+</style>
+
+## Data Collection Utility Functions
+
+Some of the lower level utility functions are already defined in `cds-utils.R` and `nrdb-utils.R`.
+
+Here is where we define the actual tables we're looking at and the columns we're extracting.
+
+We use different servers for staging vs. production accounts.
+
+```{r}
+lookup_dirac_host <- function(account_id) {
+    if (account_id == 1 || account_id == 550352) # Staging accounts
+        Sys.getenv('DIRAC_STAGING_HOST')
+    else
+        Sys.getenv('DIRAC_PROD_HOST')
+}
+```
+
+-------------
+
+Create a function to get Infrastructure data for an app.
+
+```{r}
+
+collect_infra_data <- function(account_id, app_id, begin_time, end_time, resolution=10) {
+    
+    query1 <- paste0("SELECT average(swapFreeBytes)/1000000 as swapFreeMB, ",
+                     "min(memoryFreeBytes)/1000000 as minFreeMemMB, ",
+                     "min(diskFreePercent) as minDiskFreePct, ",
+                     "average(cpuUserPercent) as cpuUserPct, ",
+                     "average(cpuSystemPercent) as cpuSystemPct, ",
+                     "average(cpuStealPercent) as cpuStealPct, ",
+                     "average(cpuIOWaitPercent) as cpuIOWaitPct, ",
+                     "average(loadAverageOneMinute) as loadAverage, ",
+                     "average(diskReadUtilizationPercent) as diskReadPct, ",
+                     "average(diskWriteUtilizationPercent) as diskWritePct ",
+                     "from SystemSample where `nr.apmApplicationIds` like '%|", app_id, "|%'")
+    
+    query2 <- paste0("SELECT average(receiveBytesPerSecond) as receiveBytes, ",
+                     "average('transmitBytesPerSecond') as transmitBytes, ", 
+                     "average('transmitErrorsPerSecond') as transmitErrors ",
+                     "FROM NetworkSample ",
+                     "WHERE `nr.apmApplicationIds` like '%|", app_id, "|%'")
+    query3 <- paste0("SELECT count(*) FROM InfrastructureEvent facet category ",
+                     "where category in ('sessions', 'alerts', 'services', 'kernel', 'system') and `nr.apmApplicationIds` like '%|", app_id, "|%'")
+    
+    data <- lapply(c(query1, query2, query3), function(query) {
+        nrdb_timeseries_batch(account_id = account_id,
+                              nrql_query = query,
+                              end_time=end_time,
+                              begin_time=begin_time,
+                              timeout=20000,
+                              host=lookup_dirac_host(account_id),
+                              resolution=resolution)
+    })
+    infra_data <- left_join(data[[1]], data[[2]], by = c("begin_time", "end_time"))
+    if (!rlang::is_empty(data[[3]])) {
+        events <- data[[3]]
+        # Replace missing with 0 count
+        events[is.na(events)] <- 0
+        infra_data <- left_join(infra_data, events, by = c("begin_time", "end_time"))
+    }
+    infra_data
+}
+```
+
+------------
+
+Create a function to get metric data for a single web application.
+
+
+```{r}
+
+collect_web_data <- function(account_id, app_id, begin_time, end_time, resolution=10) {
+
+    # Get the 85 percentile value to use as apdex t
+    # Doesn't work on full time range--times out.
+    query <- paste0('select percentile(duration, 85) from Transaction where appId=', app_id,' since 1 week ago')
+    rs <- nrdb_query(account_id, nrql_query=query, timeout=20000, host=lookup_dirac_host(account_id))
+    results <- list()
+
+    attributes <- c(rpm='count(*)',
+                    apdex=paste0('apdex(duration, ',unname(rs[1]),')'),
+                    db_throughput='sum(databaseCallCount)',
+                    db_duration='average(databaseDuration)',
+                    duration='average(duration)',
+                    external_throughput='sum(externalCallCount)',
+                    external_duration='average(externalDuration)',
+                    length='average(`response.headers.contentLength`)',
+                    total_queue_time='sum(queueDuration)',
+                    error_rate='percentage(count(*), WHERE error IS TRUE)',
+                    bg_rate='percentage(count(*), WHERE transactionType = \'Other\')')
+                    
+    query1 <- paste0('SELECT ', paste(attributes, 'as', names(attributes), collapse=', '), ' FROM Transaction extrapolate where appId=', app_id)
+
+    # Get the error page counts
+    query2 <- paste0('SELECT count(*) FROM Transaction where appId=', app_id, ' extrapolate facet httpResponseCode')
+    query3 <- paste0('SELECT count(*) FROM Transaction where appId=', app_id, ' extrapolate facet transactionType ')
+    
+    results <- lapply(list(query1, query2, query3), function(query) {
+        nrdb_timeseries_batch(account_id = account_id,
+                              nrql_query = query,
+                              resolution=resolution,
+                              end_time=end_time,
+                              begin_time=begin_time,
+                              timeout=40000,
+                              host=lookup_dirac_host(account_id))
+    })
+    web_data <- results[[1]]
+    for (rs in results[-1]) {
+        if (!is.null(rs) && !is.null(rs[['begin_time']])) {
+            rs[is.na(rs)] <- 0
+            web_data <- left_join(web_data, rs, by = c("begin_time", "end_time"))
+        }
+    }
+    mutate(web_data, 
+           queue_duration=total_queue_time/(rpm * (1-bg_rate))) %>% 
+        select(-total_queue_time, -apdex_count)
+}
+```
+
+------------
+Put it all together.
+
+```{r, echo=T}
+
+assemble_data <- function(account_id, app_id, begin_time, end_time) {
+    message("Working on ", account_id, "/", app_id,"...")
+    message("  infrastructure...")
+    data.infra <- collect_infra_data(account_id, app_id, begin_time, end_time)
+    message("  application...")
+    data.app <- collect_web_data(account_id, app_id, begin_time, end_time)
+    if (is.null(data.app) || is.null(data.infra)) {
+        message("  ...not enough data available, skipping.")
+        return(NULL)
+    }
+    full_join(data.infra, data.app, by=c('begin_time', 'end_time')) %>%
+        mutate(account_id=account_id, app_id=app_id) %>% 
+        select(account_id, app_id, begin_time, end_time, everything()) %>%
+        arrange(begin_time)
+}
+```
+
+## Collect Data from Browser Services
+
+Target Applications:
+
+
+```{r, results='asis', echo=F}
+end_time <- floor_date(Sys.time(), unit='days')
+begin_time <- end_time - ddays(7)
+
+applications <- bind_rows(
+    list(account_id = 550352, app_id = 701685, name = 'Diract-Browser'),
+    list(account_id = 550352, app_id = 993445, name = 'Browser-Monitoring-Service-Production'),
+    list(account_id = 550352, app_id = 747163, name = 'BST-Cassandra'))
+
+cat(paste0("* [", applications$name, "]",
+           "(https://staging.newrelic.com/accounts/",applications$account_id, "/applications/", applications$app_id, ")\n"))
+```
+
+Collect data from `r begin_time` to `r end_time`.
+
+```{r}
+
+timestamp <- strftime(begin_time, '%Y-%m-%d')
+
+for (i in seq_along(applications$app_id)) {
+    account_id <- applications$account_id[i]
+    app_id <- applications$app_id[i]
+    app_name <- applications$name[i]
+    filename <- paste0("data/browser/ts-", account_id, "-", app_name, "-", timestamp)
+    if (!file.exists(paste0(filename, ".csv"))) {
+        data <- assemble_data(account_id, app_id, begin_time, end_time) %>%
+            select(-account_id, -app_id) %>%
+            mutate(app_name = app_name) %>%
+            select(app_name, begin_time, end_time, rpm, duration, everything()) %>%
+            arrange(begin_time)
+        write.csv(data, paste0(filename,'.csv'))
+        saveRDS(data, paste0(filename, '.RData'))
+    }
+}
+```
+
+
+
+## Exploring the Data
+
+```{r}
+files <- list.files("data/browser", "*.RData", full.names=T)
+data.raw.1 <- readRDS(files[1])
+```
+
+### What features have "near zero variance"?
+
+Consider the "`r data.raw.1$app_name[1]`" application.  Some features are not helpful
+just on the basis of looking at their variance, regardless of the target.
+
+```{r}
+insignificant_features <- nzv(data.raw.1)[-1]
+data.important.1 <- data.raw.1[,-insignificant_features]
+names(data.raw.1)[insignificant_features]
+```
+
+### What features are _potentially_ significant?
+
+```{r}
+names(data.important.1)[-1]
+```
+
+### What are the important features in the other datasets?
+
+```{r, echo=F}
+data.raw.2 <- readRDS(files[2])
+data.important.2 <- data.raw.2[-(nzv(data.raw.2)[-1])]
+```
+
+#### `r data.important.2$app_name[1]`
+
+```{r, echo=F}
+print(names(data.important.2)[-1])
+```
+
+```{r, echo=F}
+data.raw.3 <- readRDS(files[3])
+data.important.3 <- data.raw.3[-(nzv(data.raw.3)[-1])]
+```
+
+#### `r data.important.3$app_name[1]`
+
+```{r, echo=F}
+print(names(data.important.3)[-1])
+```
+
+### Summary Plots
+
+Throughput and Response Time
+
+```{r, echo=F, fig.width=8, fig.height=8}
+combined <- bind_rows(data.raw.1, data.raw.2, data.raw.3)
+ggplot(combined) +
+    aes(x = begin_time, y = rpm) +
+    geom_line() +
+    ggtitle('Throughput') +
+    facet_grid(app_name ~ ., scales='free_y')
+ggplot(combined) +
+    aes(x = begin_time, y = duration) +
+    geom_point() +
+    ggtitle('Response Time') +
+    facet_grid(app_name ~ ., scales='free_y')
+```
+
+### Complete Data Summary
+
+#### `r files[1]`
+
+```{r}
+summary(data.important.1)
+```
+
+#### `r files[2]`
+
+```{r}
+summary(data.important.2)
+```
+
+#### `r files[3]`
+
+```{r}
+summary(data.important.3)
+```
